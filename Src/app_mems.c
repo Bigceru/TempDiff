@@ -2,11 +2,11 @@
   ******************************************************************************
   * File Name          : app_mems.c
   * Description        : This file provides code for the configuration
-  *                      of the STMicroelectronics.X-CUBE-MEMS1.9.6.0 instances.
+  *                      of the STMicroelectronics.X-CUBE-MEMS1.10.0.0 instances.
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2024 STMicroelectronics.
+  * Copyright (c) 2023 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -25,8 +25,8 @@ extern "C" {
 #include "main.h"
 #include <stdio.h>
 
-#include "stm32f4xx_hal.h"
-#include "stm32f4xx_nucleo.h"
+#include "stm32f7xx_hal.h"
+#include "custom.h"
 #include "com.h"
 #include "demo_serial.h"
 #include "bsp_ip_conf.h"
@@ -35,9 +35,11 @@ extern "C" {
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
+#define MEMS_NO_BUTTON	/* Disable button */
+
 #define DWT_LAR_KEY  0xC5ACCE55 /* DWT register unlock key */
 #define ALGO_FREQ  100U /* Algorithm frequency 100Hz */
-#define ACC_ODR  ((float)ALGO_FREQ)
+#define ACC_ODR  ((float)ALGO_FREQ) /* 100U -> ODR 104.0 Hz */
 #define ACC_FS  4 /* FS = <-4g, 4g> */
 #define ALGO_PERIOD  (1000U / ALGO_FREQ) /* Algorithm period [ms] */
 #define MOTION_FX_ENGINE_DELTATIME  0.01f
@@ -54,6 +56,7 @@ volatile uint32_t SensorsEnabled = 0;
 char LibVersion[35];
 int LibVersionLen;
 volatile uint8_t SensorReadRequest = 0;
+volatile uint8_t ButtonReadRequest = 0;
 uint8_t UseOfflineData = 0;
 offline_data_t OfflineData[OFFLINE_DATA_SIZE];
 int OfflineDataReadIndex = 0;
@@ -62,6 +65,14 @@ int OfflineDataCount = 0;
 uint32_t AlgoFreq = ALGO_FREQ;
 uint8_t Enabled6X = 0;
 static int32_t PushButtonState = GPIO_PIN_RESET;
+
+static uint32_t PushButtonFilter = 0;
+static uint32_t PushButtonTime = 0;
+
+// Push button check
+static uint32_t PushButtonTimeCheck = 0;
+static uint32_t PushButtonStatusCheck = 0;
+
 
 /* Extern variables ----------------------------------------------------------*/
 /* Private macro -------------------------------------------------------------*/
@@ -93,6 +104,11 @@ static void TIM_Config(uint32_t Freq);
 static void DWT_Init(void);
 static void DWT_Start(void);
 static uint32_t DWT_Stop(void);
+
+#ifdef BSP_IP_MEMS_INT1_PIN_NUM
+static void MEMS_INT1_Force_Low(void);
+static void MEMS_INT1_Init(void);
+#endif
 
 void MX_MEMS_Init(void)
 {
@@ -142,6 +158,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     SensorReadRequest = 1;
   }
+
+  if (htim->Instance == TIM10)
+  {
+    ButtonReadRequest = 1;
+  }
 }
 
 /* Private functions ---------------------------------------------------------*/
@@ -153,11 +174,22 @@ static void MX_DataLogFusion_Init(void)
 {
   float ans_float;
 
+#ifdef BSP_IP_MEMS_INT1_PIN_NUM
+  /* Force MEMS INT1 pin of the sensor low during startup in order to disable I3C and enable I2C. This function needs
+   * to be called only if user wants to disable I3C / enable I2C and didn't put the pull-down resistor to MEMS INT1 pin
+   * on his HW setup. This is also the case of usage X-NUCLEO-IKS4A1 or X-NUCLEO-IKS01A3 expansion board together with
+   * sensor in DIL24 adapter board where the LDO with internal pull-up is used.
+   */
+  MEMS_INT1_Force_Low();
+#endif
+
+#ifdef MEMS_NO_BUTTON
   /* Initialize button */
   BSP_PB_Init(BUTTON_KEY, BUTTON_MODE_EXTI);
 
   /* Check what is the Push Button State when the button is not pressed. It can change across families */
   PushButtonState = (BSP_PB_GetState(BUTTON_KEY)) ?  0 : 1;
+#endif
 
   /* Initialize LED */
   BSP_LED_Init(LED2);
@@ -173,6 +205,11 @@ static void MX_DataLogFusion_Init(void)
 
   /* Initialize (disabled) sensors */
   Init_Sensors();
+
+#ifdef BSP_IP_MEMS_INT1_PIN_NUM
+  /* Initialize MEMS INT1 pin back to it's default state after I3C disable / I2C enable */
+  MEMS_INT1_Init();
+#endif
 
   /* Sensor Fusion API initialization function */
   MotionFX_manager_init();
@@ -219,6 +256,7 @@ static void MX_DataLogFusion_Process(void)
 {
   static TMsg msg_dat;
   static TMsg msg_cmd;
+  static int discarded_count = 0;
 
   if (UART_ReceivedMSG((TMsg *)&msg_cmd) == 1)
   {
@@ -228,6 +266,7 @@ static void MX_DataLogFusion_Process(void)
     }
   }
 
+#ifdef MEMS_NO_BUTTON
   if (MagCalRequest == 1U)
   {
     /* Debouncing */
@@ -250,6 +289,69 @@ static void MX_DataLogFusion_Process(void)
     /* Enable magnetometer calibration */
     MotionFX_manager_MagCal_start(ALGO_PERIOD);
   }
+#endif
+
+  // ------------------------------------------------------------------
+  // Reset Button (flag set every 1 ms)
+  // ------------------------------------------------------------------
+  if (ButtonReadRequest == 1)
+  {
+    ButtonReadRequest = 0;
+
+    // Filter input
+    PushButtonFilter <<= 1;
+    PushButtonFilter |= BSP_PB_GetState(BUTTON_KEY); // ret 1 if pressed
+
+    // Set button state (16 ms debounce)
+    if ((PushButtonFilter & 0xFFFF) == 0xFFFF)
+    {
+      PushButtonState = 1;
+    }
+    if (PushButtonFilter == 0)
+    {
+      PushButtonState = 0;
+    }
+
+    // Count press time
+    if (PushButtonState)
+    {
+      PushButtonTime++;
+    }
+    else
+    {
+      PushButtonTime = 0;
+    }
+
+    // Check for push button stuck.
+    // Enable MCU reset only if we see the button not pressed
+    // for at least 2 seconds
+    if (PushButtonStatusCheck == 0)
+    {
+      if (PushButtonState == 0)
+      {
+        if (PushButtonTimeCheck < 2000)
+        {
+          PushButtonTimeCheck++;
+        }
+        if (PushButtonTimeCheck == 2000)
+        {
+          PushButtonStatusCheck = 1;
+        }
+      }
+      else
+      {
+        PushButtonTimeCheck = 0;
+      }
+    }
+
+    // Press for 4s
+    if ((PushButtonStatusCheck == 1) && (PushButtonTime > 4000))
+    {
+      // Reset MCU
+      HAL_NVIC_SystemReset();
+    }
+  }
+  // ------------------------------------------------------------------
 
   if (SensorReadRequest == 1U)
   {
@@ -291,7 +393,14 @@ static void MX_DataLogFusion_Process(void)
       }
     }
 
-    UART_SendMsg(&msg_dat);
+    if (discarded_count >= SAMPLETODISCARD)
+    {
+      UART_SendMsg(&msg_dat);
+    }
+    else
+    {
+      discarded_count++;
+    }
   }
 }
 
@@ -620,6 +729,40 @@ static void TIM_Config(uint32_t Freq)
   }
 }
 
+#ifdef BSP_IP_MEMS_INT1_PIN_NUM
+/**
+  * @brief  Force MEMS INT1 pin low
+  * @param  None
+  * @retval None
+  */
+static void MEMS_INT1_Force_Low(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin = BSP_IP_MEMS_INT1_PIN_NUM;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BSP_IP_MEMS_INT1_GPIOX, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(BSP_IP_MEMS_INT1_GPIOX, BSP_IP_MEMS_INT1_PIN_NUM, GPIO_PIN_RESET);
+}
+
+/**
+  * @brief  Configure MEMS INT1 pin to the default state
+  * @param  None
+  * @retval None
+  */
+static void MEMS_INT1_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin = BSP_IP_MEMS_INT1_PIN_NUM;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BSP_IP_MEMS_INT1_GPIOX, &GPIO_InitStruct);
+}
+#endif
+
 /**
   * @brief  Initialize DWT register for counting clock cycles purpose
   * @param  None
@@ -628,6 +771,9 @@ static void TIM_Config(uint32_t Freq)
 static void DWT_Init(void)
 {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  __DSB();
+  DWT->LAR = DWT_LAR_KEY; /* Unlock access to register */
+  __DSB();
   DWT->CTRL &= ~DWT_CTRL_CYCCNTENA_Msk; /* Disable counter */
 }
 
