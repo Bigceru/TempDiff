@@ -36,6 +36,7 @@ extern "C" {
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 #define MEMS_NO_BUTTON	/* Disable button */
+#define MILLIS_IN_ELAPSED_TIME /* RTC millis in elapsed time field */
 
 #define DWT_LAR_KEY  0xC5ACCE55 /* DWT register unlock key */
 #define ALGO_FREQ  100U /* Algorithm frequency 100Hz */
@@ -87,6 +88,9 @@ static volatile uint32_t TimeStamp = 0;
 static volatile uint8_t MagCalRequest = 0;
 static MOTION_SENSOR_Axes_t MagOffset;
 static uint8_t MagCalStatus = 0;
+
+static volatile uint32_t u32DebugIntCnt;
+static volatile uint32_t u32DebugMsgCnt;
 
 /* Private function prototypes -----------------------------------------------*/
 static void MX_DataLogFusion_Init(void);
@@ -162,6 +166,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM10)
   {
     ButtonReadRequest = 1;
+    u32DebugIntCnt++;
   }
 }
 
@@ -356,6 +361,7 @@ static void MX_DataLogFusion_Process(void)
   if (SensorReadRequest == 1U)
   {
     SensorReadRequest = 0;
+    u32DebugMsgCnt++;
 
     /* Acquire data from enabled sensors and fill Msg stream */
     RTC_Handler(&msg_dat);
@@ -442,6 +448,10 @@ static void RTC_Handler(TMsg *Msg)
     Msg->Data[4] = (uint8_t)OfflineData[OfflineDataReadIndex].minutes;
     Msg->Data[5] = (uint8_t)OfflineData[OfflineDataReadIndex].seconds;
     Msg->Data[6] = (uint8_t)OfflineData[OfflineDataReadIndex].subsec;
+
+#ifdef MILLIS_IN_ELAPSED_TIME
+    Serialize_s32(&Msg->Data[115], 0, 4);
+#endif
   }
   else
   {
@@ -460,6 +470,13 @@ static void RTC_Handler(TMsg *Msg)
     Msg->Data[4] = (uint8_t)stimestructure.Minutes;
     Msg->Data[5] = (uint8_t)stimestructure.Seconds;
     Msg->Data[6] = sub_sec;
+
+#ifdef MILLIS_IN_ELAPSED_TIME
+    ans_int32 = (RtcSynchPrediv - (int32_t)stimestructure.SubSeconds) * 1000;
+    ans_int32 /= RtcSynchPrediv + 1;
+
+    Serialize_s32(&Msg->Data[115], ans_int32, 4);
+#endif
   }
 }
 
@@ -512,7 +529,9 @@ static void FX_Data_Handler(TMsg *Msg)
         (void)memcpy(&Msg->Data[107], (void *) & (pdata_out->heading), sizeof(float));
         (void)memcpy(&Msg->Data[111], (void *) & (pdata_out->headingErr), sizeof(float));
 
+#ifndef MILLIS_IN_ELAPSED_TIME
         Serialize_s32(&Msg->Data[115], (int32_t)elapsed_time_us, 4);
+#endif
       }
     }
   }
@@ -714,8 +733,8 @@ static void Humidity_Sensor_Handler(TMsg *Msg)
   */
 static void TIM_Config(uint32_t Freq)
 {
-  const uint32_t tim_counter_clock = 2000; /* TIM counter clock 2 kHz */
-  uint32_t prescaler_value = (uint32_t)((SystemCoreClock / tim_counter_clock) - 1);
+  const uint32_t tim_counter_clock = 6000; /* TIM counter clock 6 kHz */
+  uint32_t prescaler_value = (uint32_t)((SystemCoreClock / tim_counter_clock / 2) - 1); /* TIM clock is half of core clk */
   uint32_t period = (tim_counter_clock / Freq) - 1;
 
   BSP_IP_TIM_Handle.Init.Prescaler = prescaler_value;
